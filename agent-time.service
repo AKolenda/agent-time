@@ -4,7 +4,10 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env python3 %h/Desktop/agent-time/fable-time.py --no-browser --host 127.0.0.1 --allow-client 127.0.0.1 --port 8765
+Environment=AGENT_TIME_HOST=127.0.0.1
+Environment=AGENT_TIME_PORT=8765
+EnvironmentFile=-%h/.config/agent-time.env
+ExecStart=/usr/bin/env python3 %h/Desktop/agent-time/fable-time.py --no-browser
 Restart=on-failure
 RestartSec=5
 

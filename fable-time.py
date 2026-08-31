@@ -14,6 +14,13 @@ CODEX_ROOT = Path.home() / ".codex/sessions"
 LIVE_GRACE = 600  # An unfinished transcript is live while recently updated.
 ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
 
+def configured_clients():
+    return [value.strip() for value in os.environ.get("AGENT_TIME_TRUSTED_CLIENTS", "").split(",") if value.strip()]
+
+def configured_port():
+    try: return int(os.environ.get("AGENT_TIME_PORT", "8765"))
+    except ValueError: return 8765
+
 def parse_ts(value):
     try:
         if isinstance(value, (int, float)): return float(value)
@@ -347,6 +354,6 @@ def serve(port, browser=True, host="127.0.0.1", allowed_clients=None):
     except KeyboardInterrupt:print("\nAgent Time stopped.")
     finally:server.server_close()
 def main():
-    p=argparse.ArgumentParser(description="GUI time tracker for Fable, Claude, and Codex");p.add_argument("command",nargs="?",choices=("gui","status","export"),default="gui");p.add_argument("output",nargs="?",default="~/agent-time.csv");p.add_argument("--port",type=int,default=8765);p.add_argument("--host",default="127.0.0.1");p.add_argument("--allow-client",action="append",default=[]);p.add_argument("--no-browser",action="store_true");a=p.parse_args()
+    p=argparse.ArgumentParser(description="GUI time tracker for Fable, Claude, and Codex");p.add_argument("command",nargs="?",choices=("gui","status","export"),default="gui");p.add_argument("output",nargs="?",default="~/agent-time.csv");p.add_argument("--port",type=int,default=configured_port());p.add_argument("--host",default=os.environ.get("AGENT_TIME_HOST", "127.0.0.1"));p.add_argument("--allow-client",action="append",default=configured_clients());p.add_argument("--no-browser",action="store_true");a=p.parse_args()
     status() if a.command=="status" else export(a.output) if a.command=="export" else serve(a.port,not a.no_browser,a.host,a.allow_client)
 if __name__=="__main__":main()
