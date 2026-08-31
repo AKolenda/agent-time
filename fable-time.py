@@ -18,8 +18,8 @@ def configured_clients():
     return [value.strip() for value in os.environ.get("AGENT_TIME_TRUSTED_CLIENTS", "").split(",") if value.strip()]
 
 def configured_port():
-    try: return int(os.environ.get("AGENT_TIME_PORT", "8765"))
-    except ValueError: return 8765
+    try: return int(os.environ.get("AGENT_TIME_PORT", "8080"))
+    except ValueError: return 8080
 
 def parse_ts(value):
     try:

@@ -24,7 +24,7 @@ To change the desktop IP or the VM(s) allowed to import, edit `~/.config/agent-t
 systemctl --user restart agent-time.service
 ```
 
-`AGENT_TIME_TRUSTED_CLIENTS` accepts a comma-separated list of IPs. Check the service with `systemctl --user status agent-time.service` or open `http://<AGENT_TIME_HOST>:8765/health`.
+`AGENT_TIME_TRUSTED_CLIENTS` accepts a comma-separated list of IPs. Check the service with `systemctl --user status agent-time.service` or open `http://<AGENT_TIME_HOST>:8080/health`.
 
 ## Local import API
 
