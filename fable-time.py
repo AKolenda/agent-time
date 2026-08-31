@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agent Time: local billing dashboard for Fable, Claude, and Codex."""
+"""Agent Time: local billing dashboard for Fable, Claude, Codex, and T3 Code."""
 from __future__ import annotations
 
 import argparse, csv, json, os, sys, threading, time, webbrowser
@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 CLAUDE_ROOT = Path.home() / ".claude/projects"
 CODEX_ROOT = Path.home() / ".codex/sessions"
+T3_ROOT = Path.home() / ".t3/userdata"
 LIVE_GRACE = 600  # An unfinished transcript is live while recently updated.
 ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
 
@@ -67,12 +68,12 @@ class Record:
     def reset(self):
         self.offset = self.size = 0; self.cwd = self.model = ""; self.done = []; self.active = {}
 
-    def add(self, start, end, model=""):
+    def add(self, start, end, model="", agent=None, source=None):
         if start is None or end is None or end <= start: return
         model = model or self.model
-        agent = "Codex" if self.kind == "codex" else ("Fable" if "fable" in model.lower() else "Claude")
+        agent = agent or ("Codex" if self.kind == "codex" else ("Fable" if "fable" in model.lower() else "Claude"))
         self.done.append(Interval(start, end, agent, self.project, self.cwd,
-                                  self.kind.title(), model))
+                                  source or self.kind.title(), model))
 
     def claude(self, obj):
         ts = parse_ts(obj.get("timestamp"))
@@ -118,6 +119,23 @@ class Record:
                 self.add(parse_ts(payload.get("started_at")) or active["start"],
                          parse_ts(payload.get("completed_at")) or ts or active["last"], active["model"])
 
+    def t3(self, obj):
+        """Read T3 Code's canonical local activity events without their duplicated raw events."""
+        provider = str(obj.get("provider") or "")
+        if provider not in ("codex", "claudeAgent"): return
+        ts, event = parse_ts(obj.get("createdAt")), str(obj.get("type") or "")
+        key = str(obj.get("turnId") or "")
+        if not key or ts is None: return
+        payload = obj.get("payload") or {}
+        agent = "Codex" if provider == "codex" else "Claude"
+        if event == "turn.started":
+            self.active[key] = {"start": ts, "last": ts, "model": str(payload.get("model") or agent), "agent": agent}
+            return
+        if event == "turn.completed":
+            active = self.active.pop(key, None)
+            if active:
+                self.add(active["start"], ts, active["model"], active["agent"], "T3 Code")
+
     def refresh(self):
         try: stat = self.path.stat()
         except OSError: return
@@ -130,9 +148,16 @@ class Record:
                     pos, line = handle.tell(), handle.readline()
                     if not line: break
                     if not line.endswith(b"\n"): handle.seek(pos); break
-                    try: obj = json.loads(line)
+                    try:
+                        if self.kind == "t3":
+                            marker = b"] CANON: "
+                            if marker not in line: continue
+                            obj = json.loads(line.split(marker, 1)[1])
+                        else: obj = json.loads(line)
                     except (json.JSONDecodeError, UnicodeDecodeError): continue
-                    self.claude(obj) if self.kind == "claude" else self.codex(obj)
+                    if self.kind == "claude": self.claude(obj)
+                    elif self.kind == "codex": self.codex(obj)
+                    else: self.t3(obj)
                 self.offset = handle.tell()
         except OSError: return
         self.size, self.mtime = stat.st_size, stat.st_mtime
@@ -143,24 +168,41 @@ class Record:
             end, live = (now, True) if recent else (active["last"], False)
             if end <= active["start"]: continue
             model = active["model"] or self.model
-            agent = "Codex" if self.kind == "codex" else ("Fable" if "fable" in model.lower() else "Claude")
+            agent = active.get("agent") or ("Codex" if self.kind == "codex" else ("Fable" if "fable" in model.lower() else "Claude"))
             result.append(Interval(active["start"], end, agent, self.project, self.cwd,
-                                   self.kind.title(), model, live))
+                                   "T3 Code" if self.kind == "t3" else self.kind.title(), model, live))
         for item in result:
             if not item.cwd and self.cwd: item.cwd, item.project = self.cwd, self.project
         return result
 
 class Index:
     def __init__(self): self.records, self.lock = {}, threading.Lock()
+    def t3_workspaces(self):
+        """T3 keeps the real workspace separately from its append-only event logs."""
+        try:
+            import sqlite3
+            database = T3_ROOT / "state.sqlite"
+            if not database.is_file(): return {}
+            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
+                rows = conn.execute("""select t.thread_id, p.workspace_root
+                    from projection_threads t join projection_projects p on p.project_id = t.project_id
+                    where t.deleted_at is null and p.deleted_at is null""")
+                return {str(thread): str(workspace) for thread, workspace in rows if workspace}
+        except Exception: return {}
     def paths(self):
         if CLAUDE_ROOT.is_dir(): yield from ((p, "claude") for p in CLAUDE_ROOT.glob("*/*.jsonl"))
         if CODEX_ROOT.is_dir(): yield from ((p, "codex") for p in CODEX_ROOT.glob("**/*.jsonl"))
+        if T3_ROOT.is_dir(): yield from ((p, "t3") for p in T3_ROOT.glob("logs/provider/events.*.log*"))
     def scan(self):
         with self.lock:
             seen = set()
+            t3_workspaces = self.t3_workspaces()
             for path, kind in self.paths():
                 key = str(path); seen.add(key)
                 if key not in self.records: self.records[key] = Record(path, kind)
+                if kind == "t3":
+                    parts = path.name.split(".")
+                    self.records[key].cwd = t3_workspaces.get(parts[1] if len(parts) > 2 else "", "")
                 self.records[key].refresh()
             for key in set(self.records) - seen: del self.records[key]
             now = time.time(); items = []
@@ -340,7 +382,7 @@ def export(path):
 def serve(port, browser=True, host="127.0.0.1", allowed_clients=None):
     global ALLOWED_CLIENTS
     ALLOWED_CLIENTS = {"127.0.0.1", "::1", host, *(allowed_clients or [])}
-    if not CLAUDE_ROOT.is_dir() and not CODEX_ROOT.is_dir(): sys.exit("No Claude or Codex transcripts found.")
+    if not CLAUDE_ROOT.is_dir() and not CODEX_ROOT.is_dir() and not T3_ROOT.is_dir(): sys.exit("No Claude, Codex, or T3 Code activity found.")
     print("Indexing local transcripts…",flush=True); INDEX.scan()
     try: server=ThreadingHTTPServer((host,port),Handler)
     except OSError as e:
@@ -354,6 +396,6 @@ def serve(port, browser=True, host="127.0.0.1", allowed_clients=None):
     except KeyboardInterrupt:print("\nAgent Time stopped.")
     finally:server.server_close()
 def main():
-    p=argparse.ArgumentParser(description="GUI time tracker for Fable, Claude, and Codex");p.add_argument("command",nargs="?",choices=("gui","status","export"),default="gui");p.add_argument("output",nargs="?",default="~/agent-time.csv");p.add_argument("--port",type=int,default=configured_port());p.add_argument("--host",default=os.environ.get("AGENT_TIME_HOST", "127.0.0.1"));p.add_argument("--allow-client",action="append",default=configured_clients());p.add_argument("--no-browser",action="store_true");a=p.parse_args()
+    p=argparse.ArgumentParser(description="GUI time tracker for Fable, Claude, Codex, and T3 Code");p.add_argument("command",nargs="?",choices=("gui","status","export"),default="gui");p.add_argument("output",nargs="?",default="~/agent-time.csv");p.add_argument("--port",type=int,default=configured_port());p.add_argument("--host",default=os.environ.get("AGENT_TIME_HOST", "127.0.0.1"));p.add_argument("--allow-client",action="append",default=configured_clients());p.add_argument("--no-browser",action="store_true");a=p.parse_args()
     status() if a.command=="status" else export(a.output) if a.command=="export" else serve(a.port,not a.no_browser,a.host,a.allow_client)
 if __name__=="__main__":main()

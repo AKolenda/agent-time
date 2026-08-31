@@ -1,6 +1,6 @@
 # Agent Time
 
-Agent Time reads local Claude and Codex transcripts and makes import-ready work intervals available to TimeTracker. Its network address and trusted clients are set in `~/.config/agent-time.env`.
+Agent Time reads local Claude and Codex transcripts plus T3 Code's on-device activity log. T3 Code runs are attributed to their Codex or Claude agent and retain the workspace project, so they use the same project mapping in TimeTracker. Its network address and trusted clients are set in `~/.config/agent-time.env`.
 
 Install it for the current user:
 
