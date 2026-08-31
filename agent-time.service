@@ -1,0 +1,12 @@
+[Unit]
+Description=Agent Time local API and dashboard
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 %h/Desktop/agent-time/fable-time.py --no-browser --host 127.0.0.1 --allow-client 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
