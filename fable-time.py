@@ -25,7 +25,10 @@ def configured_port():
 def parse_ts(value):
     try:
         if isinstance(value, (int, float)): return float(value)
-        text = str(value).strip().replace("Z", "+00:00")
+        text = str(value).strip()
+        try: return float(text)
+        except ValueError: pass
+        text = text.replace("Z", "+00:00")
         return datetime.fromisoformat(text).timestamp()
     except (TypeError, ValueError, OverflowError): return None
 
@@ -43,6 +46,20 @@ def real_claude_prompt(obj):
         return text and not tool
     return False
 
+def readable_title(value, fallback=""):
+    """Turn the first real user message into a short local-only conversation label."""
+    if isinstance(value, str): text = value
+    elif isinstance(value, list):
+        text = " ".join(str(item.get("text") or item.get("content") or "")
+                        for item in value if isinstance(item, dict)
+                        and item.get("type") in ("text", "input_text"))
+    elif isinstance(value, dict): text = readable_title(value.get("content"), "")
+    else: text = ""
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    useful = [line for line in lines if line and not line.startswith(("<", "# Files mentioned", "Distinguish instructions"))]
+    title = (useful[0] if useful else " ".join(text.split())).strip()
+    return (title[:117] + "…") if len(title) > 120 else (title or fallback)
+
 @dataclass
 class Interval:
     start: float
@@ -53,12 +70,15 @@ class Interval:
     source: str
     model: str = ""
     live: bool = False
+    conversation_id: str = ""
+    conversation_title: str = ""
 
 class Record:
     def __init__(self, path, kind):
         self.path, self.kind = path, kind
         self.offset = self.size = 0; self.mtime = 0.0
         self.cwd = self.model = ""; self.done = []; self.active = {}
+        self.conversation_id = path.stem; self.conversation_title = ""
 
     @property
     def project(self):
@@ -73,12 +93,16 @@ class Record:
         model = model or self.model
         agent = agent or ("Codex" if self.kind == "codex" else ("Fable" if "fable" in model.lower() else "Claude"))
         self.done.append(Interval(start, end, agent, self.project, self.cwd,
-                                  source or self.kind.title(), model))
+                                  source or self.kind.title(), model, False,
+                                  self.conversation_id, self.conversation_title))
 
     def claude(self, obj):
         ts = parse_ts(obj.get("timestamp"))
+        if obj.get("sessionId"): self.conversation_id = str(obj["sessionId"])
         if obj.get("cwd"): self.cwd = str(obj["cwd"])
         if real_claude_prompt(obj) and ts is not None:
+            if not self.conversation_title:
+                self.conversation_title = readable_title((obj.get("message") or {}).get("content"), "Claude conversation")
             old = self.active.pop("turn", None)
             if old and old["last"] > old["start"]: self.add(old["start"], old["last"], old["model"])
             self.active["turn"] = {"start": ts, "last": ts, "model": ""}
@@ -99,6 +123,9 @@ class Record:
         ts, payload = parse_ts(obj.get("timestamp")), obj.get("payload") or {}
         if obj.get("type") == "session_meta":
             if payload.get("cwd"): self.cwd = str(payload["cwd"])
+            self.conversation_id = str(payload.get("session_id") or payload.get("id") or self.conversation_id)
+            if payload.get("agent_nickname"):
+                self.conversation_title = f"Codex agent {payload['agent_nickname']}"
             return
         if obj.get("type") == "turn_context":
             if payload.get("cwd"): self.cwd = str(payload["cwd"])
@@ -106,6 +133,11 @@ class Record:
             return
         if obj.get("type") != "event_msg": return
         event, key = payload.get("type"), str(payload.get("turn_id") or "turn")
+        if event == "user_message":
+            title = readable_title(payload.get("message"), "")
+            if title and (not self.conversation_title or self.conversation_title.startswith("Codex agent ")):
+                self.conversation_title = title
+            return
         if event == "task_started":
             start = parse_ts(payload.get("started_at")) or ts
             if start: self.active[key] = {"start": start, "last": ts or start, "model": self.model}
@@ -125,6 +157,7 @@ class Record:
         if provider not in ("codex", "claudeAgent"): return
         ts, event = parse_ts(obj.get("createdAt")), str(obj.get("type") or "")
         key = str(obj.get("turnId") or "")
+        if obj.get("threadId"): self.conversation_id = str(obj["threadId"])
         if not key or ts is None: return
         payload = obj.get("payload") or {}
         agent = "Codex" if provider == "codex" else "Claude"
@@ -170,24 +203,26 @@ class Record:
             model = active["model"] or self.model
             agent = active.get("agent") or ("Codex" if self.kind == "codex" else ("Fable" if "fable" in model.lower() else "Claude"))
             result.append(Interval(active["start"], end, agent, self.project, self.cwd,
-                                   "T3 Code" if self.kind == "t3" else self.kind.title(), model, live))
+                                   "T3 Code" if self.kind == "t3" else self.kind.title(), model, live,
+                                   self.conversation_id, self.conversation_title))
         for item in result:
             if not item.cwd and self.cwd: item.cwd, item.project = self.cwd, self.project
         return result
 
 class Index:
     def __init__(self): self.records, self.lock = {}, threading.Lock()
-    def t3_workspaces(self):
-        """T3 keeps the real workspace separately from its append-only event logs."""
+    def t3_threads(self):
+        """T3 keeps the workspace and chat title separately from its append-only event logs."""
         try:
             import sqlite3
             database = T3_ROOT / "state.sqlite"
             if not database.is_file(): return {}
             with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
-                rows = conn.execute("""select t.thread_id, p.workspace_root
+                rows = conn.execute("""select t.thread_id, p.workspace_root, t.title
                     from projection_threads t join projection_projects p on p.project_id = t.project_id
                     where t.deleted_at is null and p.deleted_at is null""")
-                return {str(thread): str(workspace) for thread, workspace in rows if workspace}
+                return {str(thread): (str(workspace or ""), str(title or ""))
+                        for thread, workspace, title in rows}
         except Exception: return {}
     def paths(self):
         if CLAUDE_ROOT.is_dir(): yield from ((p, "claude") for p in CLAUDE_ROOT.glob("*/*.jsonl"))
@@ -196,13 +231,17 @@ class Index:
     def scan(self):
         with self.lock:
             seen = set()
-            t3_workspaces = self.t3_workspaces()
+            t3_threads = self.t3_threads()
             for path, kind in self.paths():
                 key = str(path); seen.add(key)
                 if key not in self.records: self.records[key] = Record(path, kind)
                 if kind == "t3":
                     parts = path.name.split(".")
-                    self.records[key].cwd = t3_workspaces.get(parts[1] if len(parts) > 2 else "", "")
+                    thread_id = parts[1] if len(parts) > 2 else ""
+                    workspace, title = t3_threads.get(thread_id, ("", ""))
+                    self.records[key].conversation_id = thread_id
+                    self.records[key].cwd = workspace
+                    self.records[key].conversation_title = title
                 self.records[key].refresh()
             for key in set(self.records) - seen: del self.records[key]
             now = time.time(); items = []
