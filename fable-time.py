@@ -13,6 +13,7 @@ CLAUDE_ROOT = Path.home() / ".claude/projects"
 CODEX_ROOT = Path.home() / ".codex/sessions"
 T3_ROOT = Path.home() / ".t3/userdata"
 LIVE_GRACE = 600  # An unfinished transcript is live while recently updated.
+TURN_IDLE_LIMIT = 1800  # A Claude turn with no activity this long is treated as abandoned, not billable.
 ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
 
 def configured_clients():
@@ -108,10 +109,20 @@ class Record:
             self.active["turn"] = {"start": ts, "last": ts, "model": ""}
         elif obj.get("type") == "assistant" and ts is not None:
             model = str((obj.get("message") or {}).get("model") or "")
-            if model and model != "<synthetic>": self.model = model
-            if "turn" in self.active:
-                self.active["turn"]["last"] = max(self.active["turn"]["last"], ts)
-                if model and model != "<synthetic>": self.active["turn"]["model"] = model
+            synthetic = not model or model == "<synthetic>"
+            if not synthetic: self.model = model
+            turn = self.active.get("turn")
+            if turn and ts - turn["last"] > TURN_IDLE_LIMIT:
+                # The turn was interrupted (crash, proxy restart, closed terminal) and only
+                # resumed much later; bill what actually ran and start counting fresh.
+                self.active.pop("turn", None)
+                if turn["last"] > turn["start"]: self.add(turn["start"], turn["last"], turn["model"])
+                turn = None if synthetic else {"start": ts, "last": ts, "model": ""}
+                if turn: self.active["turn"] = turn
+            if turn and not synthetic:
+                # Synthetic messages are error/interruption notices, not model work.
+                turn["last"] = max(turn["last"], ts)
+                turn["model"] = model
         elif obj.get("type") == "system" and obj.get("subtype") == "turn_duration" and ts:
             active = self.active.pop("turn", None)
             if active:

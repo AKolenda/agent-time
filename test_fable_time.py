@@ -40,5 +40,30 @@ class AgentTimeAttributionTests(unittest.TestCase):
         self.assertEqual(interval.conversation_title, "Mobile tracker polish")
 
 
+    def test_interrupted_claude_turn_does_not_bill_idle_hours(self):
+        record = agent_time.Record(Path("/tmp/claude-session.jsonl"), "claude")
+        prompt = {"type": "user", "timestamp": "2026-09-04T05:19:10Z", "message": {"role": "user", "content": "optimize the app"}}
+        record.claude(prompt)
+        record.claude({"type": "assistant", "timestamp": "2026-09-04T05:19:11Z", "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "Request interrupted"}]}})
+        # Nearly 13 hours later the session resumes with a meta message and a synthetic reply.
+        record.claude({"type": "user", "timestamp": "2026-09-04T18:13:47Z", "isMeta": True, "message": {"role": "user", "content": "resume"}})
+        record.claude({"type": "assistant", "timestamp": "2026-09-04T18:13:47Z", "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "ok"}]}})
+        record.claude({"type": "user", "timestamp": "2026-09-04T18:13:48Z", "message": {"role": "user", "content": "keep going"}})
+        record.claude({"type": "assistant", "timestamp": "2026-09-04T18:16:53Z", "message": {"model": "claude-fable-5-1", "content": [{"type": "text", "text": "done"}]}})
+        record.claude({"type": "system", "subtype": "turn_duration", "timestamp": "2026-09-04T18:16:53Z", "durationMs": 185000})
+
+        self.assertTrue(all(interval.end - interval.start < 600 for interval in record.done), record.done)
+        self.assertEqual(round(sum(interval.end - interval.start for interval in record.done)), 185)
+
+    def test_long_running_claude_turn_still_counts_when_model_keeps_working(self):
+        record = agent_time.Record(Path("/tmp/claude-session.jsonl"), "claude")
+        record.claude({"type": "user", "timestamp": "2026-09-04T05:00:00Z", "message": {"role": "user", "content": "run tests"}})
+        for minute in range(0, 60, 10):
+            record.claude({"type": "assistant", "timestamp": f"2026-09-04T05:{minute:02d}:30Z", "message": {"model": "claude-fable-5-1", "content": [{"type": "text", "text": "working"}]}})
+        record.claude({"type": "user", "timestamp": "2026-09-04T06:00:00Z", "message": {"role": "user", "content": "thanks"}})
+
+        self.assertEqual(len(record.done), 1)
+        self.assertEqual(round(record.done[0].end - record.done[0].start), 3030)
+
 if __name__ == "__main__":
     unittest.main()
