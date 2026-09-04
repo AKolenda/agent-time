@@ -39,7 +39,7 @@ def real_claude_prompt(obj):
     if msg.get("role") != "user": return False
     content = msg.get("content")
     if isinstance(content, str):
-        return bool(content.strip()) and not content.lstrip().startswith("<local-command-")
+        return bool(content.strip()) and not content.lstrip().startswith(("<local-command-", "<command-"))
     if isinstance(content, list):
         text = any(isinstance(x, dict) and x.get("type") in ("text", "input_text")
                    and str(x.get("text", "")).strip() for x in content)
@@ -209,7 +209,10 @@ class Record:
     def snapshot(self, now):
         result = list(self.done); recent = now - self.mtime <= LIVE_GRACE
         for active in self.active.values():
-            end, live = (now, True) if recent else (active["last"], False)
+            # A turn is live only while its own activity is recent; other writes to the
+            # transcript (queue operations, later sessions) must not keep an old turn open.
+            turn_recent = recent and now - active["last"] <= LIVE_GRACE
+            end, live = (now, True) if turn_recent else (active["last"], False)
             if end <= active["start"]: continue
             model = active["model"] or self.model
             agent = active.get("agent") or ("Codex" if self.kind == "codex" else ("Fable" if "fable" in model.lower() else "Claude"))

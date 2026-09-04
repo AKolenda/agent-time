@@ -65,5 +65,21 @@ class AgentTimeAttributionTests(unittest.TestCase):
         self.assertEqual(len(record.done), 1)
         self.assertEqual(round(record.done[0].end - record.done[0].start), 3030)
 
+    def test_slash_command_does_not_open_a_live_turn(self):
+        record = agent_time.Record(Path("/tmp/claude-session.jsonl"), "claude")
+        record.claude({"type": "user", "timestamp": "2026-09-04T06:00:00Z", "message": {"role": "user", "content": "<command-name>/plugin</command-name> <command-args>install x</command-args>"}})
+        record.mtime = agent_time.parse_ts("2026-09-04T23:00:00Z")
+        self.assertEqual(record.snapshot(agent_time.parse_ts("2026-09-04T23:00:10Z")), [])
+
+    def test_stale_turn_is_not_live_just_because_file_changed(self):
+        record = agent_time.Record(Path("/tmp/claude-session.jsonl"), "claude")
+        record.claude({"type": "user", "timestamp": "2026-09-04T06:00:00Z", "message": {"role": "user", "content": "do work"}})
+        record.claude({"type": "assistant", "timestamp": "2026-09-04T06:05:00Z", "message": {"model": "claude-opus-5", "content": [{"type": "text", "text": "ok"}]}})
+        record.mtime = agent_time.parse_ts("2026-09-04T23:00:00Z")
+        intervals = record.snapshot(agent_time.parse_ts("2026-09-04T23:00:10Z"))
+        self.assertEqual(len(intervals), 1)
+        self.assertFalse(intervals[0].live)
+        self.assertEqual(round(intervals[0].end - intervals[0].start), 300)
+
 if __name__ == "__main__":
     unittest.main()
