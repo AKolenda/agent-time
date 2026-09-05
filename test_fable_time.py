@@ -83,3 +83,24 @@ class AgentTimeAttributionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SummaryTests(unittest.TestCase):
+    def test_prompts_are_kept_for_the_summary_excerpt(self):
+        record = agent_time.Record(Path("/tmp/x.jsonl"), "claude")
+        record.claude({"type": "user", "timestamp": 1000, "sessionId": "s1", "cwd": "/w",
+                       "message": {"role": "user", "content": "<system-reminder>hidden</system-reminder>\nMake the invoice page load faster"}})
+        record.claude({"type": "user", "timestamp": 1010, "sessionId": "s1",
+                       "message": {"role": "user", "content": [{"type": "text", "text": "Also fix the totals"}]}})
+        self.assertEqual(record.prompts, ["Make the invoice page load faster", "Also fix the totals"])
+        excerpt = agent_time.Summaries.excerpt(record.conversation_title, record.prompts)
+        self.assertIn("Client request: Also fix the totals", excerpt)
+        self.assertNotIn("hidden", excerpt)
+
+    def test_summary_cache_round_trips_and_cleans_output(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            cache = agent_time.Summaries(Path(folder) / "summaries.json")
+            cache.store("chat-1", "Faster invoice page")
+            self.assertEqual(agent_time.Summaries(Path(folder) / "summaries.json").get("chat-1"), "Faster invoice page")
+        self.assertEqual(agent_time.Summaries.clean('codex\n"Improved mobile search layout."\n'), "Improved mobile search layout")

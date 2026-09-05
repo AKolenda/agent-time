@@ -28,6 +28,12 @@ systemctl --user restart agent-time.service
 
 Run `python3 -m unittest -v` from this repository to verify source attribution and timestamp filtering.
 
+## Client-facing chat descriptions
+
+Agent Time writes a short, client-facing description for each chat once it has been quiet for two minutes, using the Codex CLI (`gpt-5.6-luna`, low reasoning) and falling back to the Claude Code CLI. Both run under the desktop's own logins, so no API key is needed. The description is exposed as `conversation_summary` on every interval, alongside the raw `conversation_title`, and cached in `~/.cache/agent-time/summaries.json` so each chat is summarized once. Only the first few user prompts are sent to the model, never the full transcript.
+
+Settings in `~/.config/agent-time.env`: `AGENT_TIME_SUMMARIES=0` turns this off; `AGENT_TIME_SUMMARY_MODEL`, `AGENT_TIME_SUMMARY_EFFORT`, and `AGENT_TIME_SUMMARY_CLAUDE_MODEL` change the models.
+
 ## Local import API
 
 - `GET /api/v1/projects` lists Agent Time project names.

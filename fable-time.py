@@ -2,7 +2,7 @@
 """Agent Time: local billing dashboard for Fable, Claude, Codex, and T3 Code."""
 from __future__ import annotations
 
-import argparse, csv, json, os, sys, threading, time, webbrowser
+import argparse, csv, json, os, subprocess, sys, tempfile, threading, time, webbrowser
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +15,15 @@ T3_ROOT = Path.home() / ".t3/userdata"
 LIVE_GRACE = 600  # An unfinished transcript is live while recently updated.
 TURN_IDLE_LIMIT = 1800  # A Claude turn with no activity this long is treated as abandoned, not billable.
 ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
+SUMMARY_CACHE = Path.home() / ".cache/agent-time/summaries.json"
+SUMMARY_PROMPT_LIMIT, SUMMARY_PROMPT_CHARS = 8, 400
+SUMMARY_SETTLE = 120  # Summarize a chat once it has been quiet this long, so the description covers real work.
+SUMMARY_INSTRUCTIONS = ("You write one-line descriptions for time entries on a client invoice. Describe the outcome of the work "
+                        "in plain language a non-technical client understands. Name the feature or area worked on, not the tools, "
+                        "files, or code. Use 3 to 8 words in sentence case with no trailing period. Reply with the description only.")
+
+def summaries_enabled():
+    return os.environ.get("AGENT_TIME_SUMMARIES", "1").strip().lower() not in ("0", "false", "no", "off")
 
 def configured_clients():
     return [value.strip() for value in os.environ.get("AGENT_TIME_TRUSTED_CLIENTS", "").split(",") if value.strip()]
@@ -73,13 +82,24 @@ class Interval:
     live: bool = False
     conversation_id: str = ""
     conversation_title: str = ""
+    conversation_summary: str = ""
+
+def prompt_text(value):
+    """Plain text of a user message, ignoring harness markup, for the summary excerpt."""
+    if isinstance(value, dict): value = value.get("content")
+    if isinstance(value, list):
+        value = "\n".join(str(item.get("text") or item.get("content") or "") for item in value
+                          if isinstance(item, dict) and item.get("type") in ("text", "input_text"))
+    text = " ".join(line.strip() for line in str(value or "").splitlines()
+                    if line.strip() and not line.lstrip().startswith("<"))
+    return text[:SUMMARY_PROMPT_CHARS]
 
 class Record:
     def __init__(self, path, kind):
         self.path, self.kind = path, kind
         self.offset = self.size = 0; self.mtime = 0.0
         self.cwd = self.model = ""; self.done = []; self.active = {}
-        self.conversation_id = path.stem; self.conversation_title = ""
+        self.conversation_id = path.stem; self.conversation_title = ""; self.prompts = []
 
     @property
     def project(self):
@@ -87,7 +107,11 @@ class Record:
         return self.path.parent.name if self.kind == "claude" else "Unknown project"
 
     def reset(self):
-        self.offset = self.size = 0; self.cwd = self.model = ""; self.done = []; self.active = {}
+        self.offset = self.size = 0; self.cwd = self.model = ""; self.done = []; self.active = {}; self.prompts = []
+
+    def remember_prompt(self, value):
+        text = prompt_text(value)
+        if text and len(self.prompts) < SUMMARY_PROMPT_LIMIT: self.prompts.append(text)
 
     def add(self, start, end, model="", agent=None, source=None):
         if start is None or end is None or end <= start: return
@@ -104,6 +128,7 @@ class Record:
         if real_claude_prompt(obj) and ts is not None:
             if not self.conversation_title:
                 self.conversation_title = readable_title((obj.get("message") or {}).get("content"), "Claude conversation")
+            self.remember_prompt((obj.get("message") or {}).get("content"))
             old = self.active.pop("turn", None)
             if old and old["last"] > old["start"]: self.add(old["start"], old["last"], old["model"])
             self.active["turn"] = {"start": ts, "last": ts, "model": ""}
@@ -146,6 +171,7 @@ class Record:
         event, key = payload.get("type"), str(payload.get("turn_id") or "turn")
         if event == "user_message":
             title = readable_title(payload.get("message"), "")
+            self.remember_prompt(payload.get("message"))
             if title and (not self.conversation_title or self.conversation_title.startswith("Codex agent ")):
                 self.conversation_title = title
             return
@@ -260,7 +286,18 @@ class Index:
             for key in set(self.records) - seen: del self.records[key]
             now = time.time(); items = []
             for record in self.records.values(): items.extend(record.snapshot(now))
+            for item in items: item.conversation_summary = SUMMARIES.get(item.conversation_id)
             return sorted(items, key=lambda x: x.start)
+    def summary_candidates(self, now):
+        """Chats that have settled and still need a client-facing description."""
+        with self.lock:
+            found = []
+            for record in self.records.values():
+                if not record.conversation_id or SUMMARIES.get(record.conversation_id): continue
+                if not record.done and not record.active: continue
+                if now - record.mtime < SUMMARY_SETTLE: continue
+                found.append((record.conversation_id, record.kind, record.conversation_title, list(record.prompts)))
+            return found
     def payload(self):
         began = time.perf_counter(); items = self.scan()
         return {"now": time.time(), "timezone": datetime.now().astimezone().tzname(),
@@ -269,6 +306,74 @@ class Index:
                 "scan_ms": round((time.perf_counter()-began)*1000)}
 
 INDEX = Index()
+
+def t3_prompts(thread_id):
+    try:
+        import sqlite3
+        with sqlite3.connect(f"file:{T3_ROOT / 'state.sqlite'}?mode=ro", uri=True) as conn:
+            rows = conn.execute("select text from projection_thread_messages where thread_id = ? and role = 'user' order by created_at limit ?",
+                                (thread_id, SUMMARY_PROMPT_LIMIT))
+            return [prompt_text(text) for (text,) in rows if text]
+    except Exception: return []
+
+class Summaries:
+    """Client-facing chat descriptions written by the local Codex or Claude Code CLI and cached per chat."""
+    def __init__(self, path=SUMMARY_CACHE):
+        self.path, self.lock, self.data, self.failed = path, threading.Lock(), {}, {}
+        try: self.data = {k: v for k, v in json.loads(path.read_text()).items() if isinstance(v, str)}
+        except (OSError, ValueError): pass
+    def get(self, conversation_id):
+        return self.data.get(conversation_id, "")
+    def store(self, conversation_id, title):
+        with self.lock:
+            self.data[conversation_id] = title
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.path.with_suffix(".tmp"); temporary.write_text(json.dumps(self.data, indent=1)); temporary.replace(self.path)
+            except OSError: pass
+    @staticmethod
+    def excerpt(title, prompts):
+        body = "\n\n".join(f"Client request: {prompt}" for prompt in prompts) or "(no messages available)"
+        return f"Chat title: {title or '(none)'}\n\n{body}"
+    @staticmethod
+    def commands():
+        model = os.environ.get("AGENT_TIME_SUMMARY_MODEL", "gpt-5.6-luna"); effort = os.environ.get("AGENT_TIME_SUMMARY_EFFORT", "low")
+        claude_model = os.environ.get("AGENT_TIME_SUMMARY_CLAUDE_MODEL", "claude-sonnet-5")
+        return [("codex", ["codex", "exec", "--model", model, "-c", f"model_reasoning_effort={json.dumps(effort)}", "--sandbox", "read-only",
+                           "--skip-git-repo-check", "--ephemeral", "--ignore-rules", "--color", "never", "-o", "-"]),
+                ("claude", ["claude", "-p", "--model", claude_model, "--output-format", "text", "--no-session-persistence"])]
+    @staticmethod
+    def clean(text):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        title = (lines[-1] if lines else "").strip("\"'“”. ")
+        return " ".join(title.split())[:80]
+    def write(self, title, prompts):
+        excerpt = self.excerpt(title, prompts)
+        for name, command in self.commands():
+            if self.failed.get(name, 0) > time.time(): continue
+            try:
+                result = subprocess.run(command + [f"{SUMMARY_INSTRUCTIONS} The chat follows.\n\n{excerpt}"], stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=90, cwd=tempfile.gettempdir(),
+                                        env={**os.environ, "NO_COLOR": "1"})
+                summary = self.clean(result.stdout) if result.returncode == 0 else ""
+                if summary: return summary
+            except FileNotFoundError: self.failed[name] = float("inf")
+            except (subprocess.SubprocessError, OSError): pass
+            self.failed[name] = time.time() + 300  # Leave a misbehaving CLI alone for a while.
+        return ""
+    def worker(self):
+        while True:
+            for conversation_id, kind, title, prompts in INDEX.summary_candidates(time.time()):
+                if kind == "t3" and not prompts: prompts = t3_prompts(conversation_id)
+                if not prompts and not title: continue
+                summary = self.write(title, prompts)
+                if summary: self.store(conversation_id, summary)
+                elif all(self.failed.get(name, 0) > time.time() for name, _ in self.commands()): break
+            time.sleep(30)
+    def start(self):
+        if summaries_enabled(): threading.Thread(target=self.worker, name="agent-time-summaries", daemon=True).start()
+
+SUMMARIES = Summaries()
 
 API_DEFAULT_GAP_MINUTES = 15
 
@@ -436,7 +541,7 @@ def serve(port, browser=True, host="127.0.0.1", allowed_clients=None):
     global ALLOWED_CLIENTS
     ALLOWED_CLIENTS = {"127.0.0.1", "::1", host, *(allowed_clients or [])}
     if not CLAUDE_ROOT.is_dir() and not CODEX_ROOT.is_dir() and not T3_ROOT.is_dir(): sys.exit("No Claude, Codex, or T3 Code activity found.")
-    print("Indexing local transcripts…",flush=True); INDEX.scan()
+    print("Indexing local transcripts…",flush=True); INDEX.scan(); SUMMARIES.start()
     try: server=ThreadingHTTPServer((host,port),Handler)
     except OSError as e:
         if e.errno==98:
