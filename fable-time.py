@@ -18,9 +18,11 @@ ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
 SUMMARY_CACHE = Path.home() / ".cache/agent-time/summaries.json"
 SUMMARY_PROMPT_LIMIT, SUMMARY_PROMPT_CHARS = 8, 400
 SUMMARY_SETTLE = 120  # Summarize a chat once it has been quiet this long, so the description covers real work.
-SUMMARY_INSTRUCTIONS = ("You write one-line descriptions for time entries on a client invoice. Describe the outcome of the work "
-                        "in plain language a non-technical client understands. Name the feature or area worked on, not the tools, "
-                        "files, or code. Use 3 to 8 words in sentence case with no trailing period. Reply with the description only.")
+SUMMARY_INSTRUCTIONS = ("You write one-line descriptions for time entries on a client invoice.\n"
+                        "- Identify the feature or product change worked on (subject and outcome).\n"
+                        "- Ignore incidental artifacts: never name meeting transcripts, Google Meet codes, file paths, subagents, or raw tools.\n"
+                        "- Do not copy or truncate raw user messages.\n"
+                        "- Use 3 to 8 words in sentence case with no trailing period (e.g. \"Build Mosaic offer calculator\").")
 
 def summaries_enabled():
     return os.environ.get("AGENT_TIME_SUMMARIES", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -58,6 +60,7 @@ def real_claude_prompt(obj):
 
 def readable_title(value, fallback=""):
     """Turn the first real user message into a short local-only conversation label."""
+    import re
     if isinstance(value, str): text = value
     elif isinstance(value, list):
         text = " ".join(str(item.get("text") or item.get("content") or "")
@@ -66,7 +69,14 @@ def readable_title(value, fallback=""):
     elif isinstance(value, dict): text = readable_title(value.get("content"), "")
     else: text = ""
     lines = [" ".join(line.split()) for line in text.splitlines()]
-    useful = [line for line in lines if line and not line.startswith(("<", "# Files mentioned", "Distinguish instructions"))]
+    useful = []
+    for line in lines:
+        if not line: continue
+        if line.startswith(("<", "# Files mentioned", "Distinguish instructions")): continue
+        if re.search(r"^[a-z]{3}-[a-z]{4}-[a-z]{3}\b", line.lower()): continue
+        if re.search(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", line.lower()): continue
+        if line.endswith("- Transcript") or line.endswith("Attendees"): continue
+        useful.append(line)
     title = (useful[0] if useful else " ".join(text.split())).strip()
     return (title[:117] + "…") if len(title) > 120 else (title or fallback)
 
@@ -91,8 +101,11 @@ def prompt_text(value):
         value = "\n".join(str(item.get("text") or item.get("content") or "") for item in value
                           if isinstance(item, dict) and item.get("type") in ("text", "input_text"))
     text = " ".join(line.strip() for line in str(value or "").splitlines()
-                    if line.strip() and not line.lstrip().startswith("<"))
-    return text[:SUMMARY_PROMPT_CHARS]
+                    if line.strip() and not line.lstrip().startswith("<")
+                    and not line.endswith("- Transcript"))
+    if len(text) > SUMMARY_PROMPT_CHARS:
+        return text[:100] + " ... " + text[-(SUMMARY_PROMPT_CHARS-105):]
+    return text
 
 class Record:
     def __init__(self, path, kind):
@@ -126,11 +139,12 @@ class Record:
         if obj.get("sessionId"): self.conversation_id = str(obj["sessionId"])
         if obj.get("cwd"): self.cwd = str(obj["cwd"])
         if real_claude_prompt(obj) and ts is not None:
-            if not self.conversation_title:
-                self.conversation_title = readable_title((obj.get("message") or {}).get("content"), "Claude conversation")
-            self.remember_prompt((obj.get("message") or {}).get("content"))
             old = self.active.pop("turn", None)
             if old and old["last"] > old["start"]: self.add(old["start"], old["last"], old["model"])
+            title = readable_title((obj.get("message") or {}).get("content"), "")
+            if title or not self.conversation_title:
+                self.conversation_title = title or "Claude conversation"
+            self.remember_prompt((obj.get("message") or {}).get("content"))
             self.active["turn"] = {"start": ts, "last": ts, "model": ""}
         elif obj.get("type") == "assistant" and ts is not None:
             model = str((obj.get("message") or {}).get("model") or "")
@@ -172,8 +186,7 @@ class Record:
         if event == "user_message":
             title = readable_title(payload.get("message"), "")
             self.remember_prompt(payload.get("message"))
-            if title and (not self.conversation_title or self.conversation_title.startswith("Codex agent ")):
-                self.conversation_title = title
+            if title: self.conversation_title = title
             return
         if event == "task_started":
             start = parse_ts(payload.get("started_at")) or ts
