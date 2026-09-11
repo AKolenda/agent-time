@@ -19,10 +19,11 @@ SUMMARY_CACHE = Path.home() / ".cache/agent-time/summaries.json"
 SUMMARY_PROMPT_LIMIT, SUMMARY_PROMPT_CHARS = 8, 400
 SUMMARY_SETTLE = 120  # Summarize a chat once it has been quiet this long, so the description covers real work.
 SUMMARY_INSTRUCTIONS = ("You write one-line descriptions for time entries on a client invoice.\n"
-                        "- Identify the feature or product change worked on (subject and outcome).\n"
-                        "- Ignore incidental artifacts: never name meeting transcripts, Google Meet codes, file paths, subagents, or raw tools.\n"
-                        "- Do not copy or truncate raw user messages.\n"
-                        "- Use 3 to 8 words in sentence case with no trailing period (e.g. \"Build Mosaic offer calculator\").")
+                        "- Provide a high-level, client-friendly summary of the value delivered (e.g. \"Improve user experience\" or \"Clean up final stages\").\n"
+                        "- Avoid overly technical details, file names, subagents, tools, or specific component names like 'pipeline editor' or 'input styling'.\n"
+                        "- Ignore incidental artifacts: never name meeting transcripts or Google Meet codes.\n"
+                        "- Do not copy raw user messages.\n"
+                        "- Use 3 to 8 words in sentence case with no trailing period.")
 
 def summaries_enabled():
     return os.environ.get("AGENT_TIME_SUMMARIES", "1").strip().lower() not in ("0", "false", "no", "off")
