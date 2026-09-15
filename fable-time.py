@@ -115,6 +115,7 @@ class Interval:
     conversation_id: str = ""
     conversation_title: str = ""
     conversation_summary: str = ""
+    canonical_conversation_id: str = ""
 
 def prompt_text(value):
     """Plain text of a user message, ignoring harness markup, for the summary excerpt."""
@@ -300,6 +301,8 @@ class Index:
                         for thread, workspace, title in rows}
         except Exception: return {}
     def t3_session_titles(self):
+        return {key: value[1] for key, value in self.t3_session_links().items()}
+    def t3_session_links(self):
         """Resolve native provider sessions back to their saved T3 thread names."""
         try:
             import sqlite3
@@ -312,12 +315,12 @@ class Index:
                     where t.deleted_at is null""")
                 titles = {}
                 for thread, title, provider_thread, provider_session, raw in rows:
-                    if not title or not title.strip(): continue
+
                     try: cursor = json.loads(raw or "{}")
                     except (TypeError, ValueError): cursor = {}
                     if not isinstance(cursor, dict): cursor = {}
                     for key in (thread, provider_thread, provider_session, cursor.get("resume")):
-                        if isinstance(key, str) and key: titles[key] = title.strip()
+                        if isinstance(key, str) and key: titles[key] = (thread, (title or "").strip())
                 return titles
         except (sqlite3.Error, OSError): return {}
     def paths(self):
@@ -343,10 +346,12 @@ class Index:
             now = time.time(); items = []
             for record in self.records.values(): items.extend(record.snapshot(now))
             for item in items: item.conversation_summary = SUMMARIES.get(item.conversation_id)
-            titles = self.t3_session_titles()
+            links = self.t3_session_links()
             for item in items:
-                if item.conversation_id in titles:
-                    item.conversation_title = titles[item.conversation_id]
+                if item.conversation_id in links:
+                    canonical_id, title = links[item.conversation_id]
+                    item.canonical_conversation_id = canonical_id
+                    if title: item.conversation_title = title
             return sorted(items, key=lambda x: x.start)
     def summary_candidates(self, now):
         """Chats that have settled and still need a client-facing description."""

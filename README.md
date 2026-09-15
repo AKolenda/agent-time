@@ -2,7 +2,16 @@
 
 Agent Time reads local Claude and Codex transcripts plus T3 Code's on-device activity log. T3 Code runs are attributed to their Codex or Claude agent and retain the workspace project, so they use the same project mapping in TimeTracker. Its network address and trusted clients are set in `~/.config/agent-time.env`.
 
-Install it for the current user:
+Requires Python 3.10+ and Linux with systemd. The optional title generator also requires an authenticated Codex CLI.
+
+Clone and install it for the current user:
+
+```bash
+mkdir -p ~/Desktop
+git clone https://github.com/AKolenda/agent-time.git ~/Desktop/agent-time
+```
+
+Then install the service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -40,8 +49,14 @@ Settings in `~/.config/agent-time.env`: `AGENT_TIME_SUMMARIES=0` turns this off;
 - `GET /api/v1/intervals` returns raw intervals, including whether each interval came from T3 Code, Codex, or Claude plus its local conversation ID and title. Optional query filters: `project`, `agent`, `start`, and `end`; timestamps accept Unix seconds or ISO-8601.
 - `GET /api/v1/import` returns billable blocks grouped only within each source project. It accepts the same filters plus `gap_minutes`, which defaults to `15` (use `0` for exact transcript intervals).
 
-The service binds only to the configured desktop LAN address and permits requests only from the configured clients, plus the desktop itself. No cloud service or API key is used.
+The example binds to loopback by default. For remote imports, configure the collector’s LAN address and trusted TimeTracker clients. The service binds only to the configured address and permits requests only from the configured clients, plus the desktop itself. The activity collector does not upload logs. Optional title generation sends a bounded prompt excerpt through your authenticated Codex CLI; set `AGENT_TIME_SUMMARIES=0` to disable it.
 
 ### Reading chats from TimeTracker
 
 `GET /api/v1/transcript?source=T3%20Code&id=<thread-id>&offset=0` returns up to 100 user/assistant messages, `nextOffset`, and `totalMessages`. The same trusted-client allowlist protects this endpoint. Only valid chat IDs and known sources (`T3 Code`, `Claude`, `Codex`) are accepted; filesystem paths cannot be supplied. Configure the collector URL in TimeTracker to read chats from their original machine.
+
+The API includes `canonical_conversation_id` when a native provider session maps to a T3 thread. Consumers can merge those records by machine and canonical ID, taking the union of overlapping activity instead of adding duplicate durations.
+
+## License
+
+GPL-3.0, matching [TimeTracker](https://github.com/AKolenda/timetracker). See [LICENSE](LICENSE).

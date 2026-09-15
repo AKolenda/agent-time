@@ -1,2 +1,10 @@
 __pycache__/
 *.py[cod]
+
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.jsonl
+*.log

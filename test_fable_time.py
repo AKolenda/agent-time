@@ -123,6 +123,7 @@ class T3FallbackTests(unittest.TestCase):
                 with patch.object(agent_time, "T3_ROOT", Path(folder)):
                     index = agent_time.Index()
                     self.assertEqual(index.t3_session_titles()["claude-chat"], "Review Client Feedback")
+                    self.assertEqual(index.t3_session_links()["claude-chat"][0], index.t3_session_links()["t3-chat"][0])
                     db.execute("update projection_threads set title = 'Improve Client Workflow'")
                     db.commit()
                     self.assertEqual(index.t3_session_titles()["claude-chat"], "Improve Client Workflow")
