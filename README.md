@@ -41,3 +41,7 @@ Settings in `~/.config/agent-time.env`: `AGENT_TIME_SUMMARIES=0` turns this off;
 - `GET /api/v1/import` returns billable blocks grouped only within each source project. It accepts the same filters plus `gap_minutes`, which defaults to `15` (use `0` for exact transcript intervals).
 
 The service binds only to the configured desktop LAN address and permits requests only from the configured clients, plus the desktop itself. No cloud service or API key is used.
+
+### Reading chats from TimeTracker
+
+`GET /api/v1/transcript?source=T3%20Code&id=<thread-id>&offset=0` returns up to 100 user/assistant messages, `nextOffset`, and `totalMessages`. The same trusted-client allowlist protects this endpoint. Only valid chat IDs and known sources (`T3 Code`, `Claude`, `Codex`) are accepted; filesystem paths cannot be supplied. Configure the collector URL in TimeTracker to read chats from their original machine.

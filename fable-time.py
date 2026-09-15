@@ -2,7 +2,7 @@
 """Agent Time: local billing dashboard for Fable, Claude, Codex, and T3 Code."""
 from __future__ import annotations
 
-import argparse, csv, json, os, subprocess, sys, tempfile, threading, time, webbrowser
+import argparse, csv, json, os, sqlite3, subprocess, sys, tempfile, threading, time, webbrowser
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -562,6 +562,16 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path); path, params = url.path, parse_qs(url.query)
         if path == "/": self.send(HTML.encode(), "text/html; charset=utf-8")
         elif path == "/api/data": self.json(INDEX.payload())
+        elif path == "/api/v1/transcript":
+            from agent_transcripts import read_transcript, transcript_page
+            try:
+                offset = int((params.get("offset") or ["0"])[-1])
+                if offset < 0: raise ValueError("Offset must be nonnegative")
+                transcript = read_transcript((params.get("source") or [""])[-1], (params.get("id") or [""])[-1], T3_ROOT, CLAUDE_ROOT, CODEX_ROOT)
+                if transcript is None: self.json({"error": "Chat not found on this machine."}, 404)
+                else: self.json({"transcript": transcript_page(transcript, offset)})
+            except ValueError as error: self.json({"error": str(error)}, 400)
+            except (OSError, sqlite3.Error): self.json({"error": "Unable to read this chat on the source machine."}, 500)
         elif path == "/api/v1/projects":
             items = INDEX.scan()
             self.json({"projects": sorted({x.project for x in items}, key=str.casefold),
