@@ -18,12 +18,32 @@ ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
 SUMMARY_CACHE = Path.home() / ".cache/agent-time/summaries.json"
 SUMMARY_PROMPT_LIMIT, SUMMARY_PROMPT_CHARS = 8, 400
 SUMMARY_SETTLE = 120  # Summarize a chat once it has been quiet this long, so the description covers real work.
-SUMMARY_INSTRUCTIONS = ("You write one-line descriptions for time entries on a client invoice.\n"
-                        "- Provide a high-level, client-friendly summary of the value delivered (e.g. \"Improve user experience\" or \"Clean up final stages\").\n"
-                        "- Avoid overly technical details, file names, subagents, tools, or specific component names like 'pipeline editor' or 'input styling'.\n"
-                        "- Ignore incidental artifacts: never name meeting transcripts or Google Meet codes.\n"
-                        "- Do not copy raw user messages.\n"
-                        "- Use 3 to 8 words in sentence case with no trailing period.")
+# Same editorial prompt as T3 Code TextGenerationPrompts.ts.
+SUMMARY_INSTRUCTIONS = """Generate a title that will help the user recognize this T3 Code thread weeks later.
+Return JSON with exactly one key: title.
+
+Before answering, silently reduce the request to:
+- Subject: What system, feature, or problem is this really about?
+- Outcome: What does the user ultimately want to understand or change?
+- Incidental instructions: What only describes how the agent should do the work?
+
+Title the subject and outcome. Discard incidental instructions.
+
+Editorial rules:
+- 3-8 words, fewer than 40 characters.
+- Use a compact noun phrase or clear action phrase.
+- Capture the umbrella goal when the request lists several symptoms or steps.
+- Name the product change, not the mock, plan, report, branch, or PR used to produce it.
+- Models, subagents, tools, output formats, and monitoring instructions do not belong in the title unless they are themselves the topic.
+- For reviews, name what is being reviewed and the relevant concern. Avoid generic titles such as "Review PR 123" when linked or attached context reveals the subject.
+- For research, name the question domain rather than the requested research process.
+- Do not claim the work is complete.
+- Do not copy and truncate the user's message.
+- Avoid project names already visible in the UI, quotes, labels, filler, and trailing punctuation.
+- Use attached images as primary context for UI issues.
+- When a URL or attachment is the only source of the subject, use available tools to inspect it directly.
+- Local git history is not evidence of what a linked PR or issue is about. Never title the thread after branch names, commit messages, or merged commits found in the checkout.
+- If a linked PR or issue cannot be read, fall back to the user's stated action plus its number, such as "Take Over PR 8588". This is the one case where a PR or issue number belongs in the title."""
 
 def summaries_enabled():
     return os.environ.get("AGENT_TIME_SUMMARIES", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -278,6 +298,27 @@ class Index:
                 return {str(thread): (str(workspace or ""), str(title or ""))
                         for thread, workspace, title in rows}
         except Exception: return {}
+    def t3_session_titles(self):
+        """Resolve native provider sessions back to their saved T3 thread names."""
+        try:
+            import sqlite3
+            with sqlite3.connect(f"file:{T3_ROOT / 'state.sqlite'}?mode=ro", uri=True) as conn:
+                rows = conn.execute("""select t.thread_id, t.title, s.provider_thread_id,
+                    s.provider_session_id, r.resume_cursor_json
+                    from projection_threads t
+                    left join projection_thread_sessions s on s.thread_id = t.thread_id
+                    left join provider_session_runtime r on r.thread_id = t.thread_id
+                    where t.deleted_at is null""")
+                titles = {}
+                for thread, title, provider_thread, provider_session, raw in rows:
+                    if not title or not title.strip(): continue
+                    try: cursor = json.loads(raw or "{}")
+                    except (TypeError, ValueError): cursor = {}
+                    if not isinstance(cursor, dict): cursor = {}
+                    for key in (thread, provider_thread, provider_session, cursor.get("resume")):
+                        if isinstance(key, str) and key: titles[key] = title.strip()
+                return titles
+        except (sqlite3.Error, OSError): return {}
     def paths(self):
         if CLAUDE_ROOT.is_dir(): yield from ((p, "claude") for p in CLAUDE_ROOT.glob("*/*.jsonl"))
         if CODEX_ROOT.is_dir(): yield from ((p, "codex") for p in CODEX_ROOT.glob("**/*.jsonl"))
@@ -301,16 +342,21 @@ class Index:
             now = time.time(); items = []
             for record in self.records.values(): items.extend(record.snapshot(now))
             for item in items: item.conversation_summary = SUMMARIES.get(item.conversation_id)
+            titles = self.t3_session_titles()
+            for item in items:
+                if item.conversation_id in titles:
+                    item.conversation_title = titles[item.conversation_id]
             return sorted(items, key=lambda x: x.start)
     def summary_candidates(self, now):
         """Chats that have settled and still need a client-facing description."""
         with self.lock:
             found = []
+            titles = self.t3_session_titles()
             for record in self.records.values():
                 if not record.conversation_id or SUMMARIES.get(record.conversation_id): continue
                 if not record.done and not record.active: continue
                 if now - record.mtime < SUMMARY_SETTLE: continue
-                found.append((record.conversation_id, record.kind, record.conversation_title, list(record.prompts)))
+                found.append((record.conversation_id, record.kind, titles.get(record.conversation_id, record.conversation_title), list(record.prompts)))
             return found
     def payload(self):
         began = time.perf_counter(); items = self.scan()
@@ -351,13 +397,16 @@ class Summaries:
         return f"Chat title: {title or '(none)'}\n\n{body}"
     @staticmethod
     def commands():
-        model = os.environ.get("AGENT_TIME_SUMMARY_MODEL", "gpt-5.6-luna"); effort = os.environ.get("AGENT_TIME_SUMMARY_EFFORT", "low")
-        claude_model = os.environ.get("AGENT_TIME_SUMMARY_CLAUDE_MODEL", "claude-sonnet-5")
+        model = os.environ.get("AGENT_TIME_SUMMARY_MODEL", "gpt-5.6-terra"); effort = os.environ.get("AGENT_TIME_SUMMARY_EFFORT", "low")
         return [("codex", ["codex", "exec", "--model", model, "-c", f"model_reasoning_effort={json.dumps(effort)}", "--sandbox", "read-only",
-                           "--skip-git-repo-check", "--ephemeral", "--ignore-rules", "--color", "never", "-o", "-"]),
-                ("claude", ["claude", "-p", "--model", claude_model, "--output-format", "text", "--no-session-persistence"])]
+                           "--skip-git-repo-check", "--ephemeral", "--ignore-rules", "--color", "never", "-o", "-"])]
     @staticmethod
     def clean(text):
+        try:
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("title"), str): return ""
+            text = parsed["title"]
+        except (ValueError, TypeError): return ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         title = (lines[-1] if lines else "").strip("\"'“”. ")
         return " ".join(title.split())[:80]

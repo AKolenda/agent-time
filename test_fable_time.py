@@ -103,4 +103,32 @@ class SummaryTests(unittest.TestCase):
             cache = agent_time.Summaries(Path(folder) / "summaries.json")
             cache.store("chat-1", "Faster invoice page")
             self.assertEqual(agent_time.Summaries(Path(folder) / "summaries.json").get("chat-1"), "Faster invoice page")
-        self.assertEqual(agent_time.Summaries.clean('codex\n"Improved mobile search layout."\n'), "Improved mobile search layout")
+        self.assertEqual(agent_time.Summaries.clean('{"title":"Improved mobile search layout."}'), "Improved mobile search layout")
+
+
+class T3FallbackTests(unittest.TestCase):
+    def test_native_session_uses_saved_t3_title_and_tracks_renames(self):
+        import tempfile, sqlite3
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as folder:
+            with sqlite3.connect(Path(folder) / "state.sqlite") as db:
+                db.executescript("""
+                    create table projection_threads(thread_id text, title text, deleted_at text);
+                    create table projection_thread_sessions(thread_id text, provider_thread_id text, provider_session_id text);
+                    create table provider_session_runtime(thread_id text, resume_cursor_json text);
+                    insert into projection_threads values ('t3-chat', 'Review Client Feedback', null);
+                    insert into provider_session_runtime values ('t3-chat', '{"resume":"claude-chat"}');
+                """)
+                with patch.object(agent_time, "T3_ROOT", Path(folder)):
+                    index = agent_time.Index()
+                    self.assertEqual(index.t3_session_titles()["claude-chat"], "Review Client Feedback")
+                    db.execute("update projection_threads set title = 'Improve Client Workflow'")
+                    db.commit()
+                    self.assertEqual(index.t3_session_titles()["claude-chat"], "Improve Client Workflow")
+                    db.execute("update projection_threads set deleted_at = 'now'")
+                    db.commit()
+                    self.assertNotIn("claude-chat", index.t3_session_titles())
+
+    def test_invalid_title_json_is_not_cached_as_a_name(self):
+        self.assertEqual(agent_time.Summaries.clean('{"wrong":"name"}'), "")
+        self.assertEqual(agent_time.Summaries.clean('unexpected CLI output'), "")
