@@ -59,4 +59,4 @@ The API includes `canonical_conversation_id` when a native provider session maps
 
 ## License
 
-GPL-3.0, matching [TimeTracker](https://github.com/AKolenda/timetracker). See [LICENSE](LICENSE).
+Agent Time is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only). See [LICENSE](LICENSE).
