@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from contextlib import closing
 
 
 MODULE_PATH = Path(__file__).with_name("fable-time.py")
@@ -111,7 +112,7 @@ class T3FallbackTests(unittest.TestCase):
         import tempfile, sqlite3
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as folder:
-            with sqlite3.connect(Path(folder) / "state.sqlite") as db:
+            with closing(sqlite3.connect(Path(folder) / "state.sqlite")) as db, db:
                 db.executescript("""
                     create table projection_threads(thread_id text, title text, deleted_at text);
                     create table projection_thread_sessions(thread_id text, provider_thread_id text, provider_session_id text);

@@ -1,5 +1,6 @@
 """Read chat messages on the collector that owns them; no arbitrary file paths."""
 import json
+from contextlib import closing
 import re
 import sqlite3
 from pathlib import Path
@@ -38,7 +39,7 @@ def read_transcript(source, conversation_id, t3_root, claude_root, codex_root):
         database = t3_root / "state.sqlite"
         if not database.is_file():
             return None
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
             thread = conn.execute("select title from projection_threads where thread_id = ?", (conversation_id,)).fetchone()
             if not thread:
                 return None

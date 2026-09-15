@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from contextlib import closing
 from urllib.parse import parse_qs, urlparse
 
 CLAUDE_ROOT = Path.home() / ".claude/projects"
@@ -291,7 +292,7 @@ class Index:
             import sqlite3
             database = T3_ROOT / "state.sqlite"
             if not database.is_file(): return {}
-            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
+            with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
                 rows = conn.execute("""select t.thread_id, p.workspace_root, t.title
                     from projection_threads t join projection_projects p on p.project_id = t.project_id
                     where t.deleted_at is null and p.deleted_at is null""")
@@ -302,7 +303,7 @@ class Index:
         """Resolve native provider sessions back to their saved T3 thread names."""
         try:
             import sqlite3
-            with sqlite3.connect(f"file:{T3_ROOT / 'state.sqlite'}?mode=ro", uri=True) as conn:
+            with closing(sqlite3.connect(f"file:{T3_ROOT / 'state.sqlite'}?mode=ro", uri=True)) as conn:
                 rows = conn.execute("""select t.thread_id, t.title, s.provider_thread_id,
                     s.provider_session_id, r.resume_cursor_json
                     from projection_threads t
@@ -370,7 +371,7 @@ INDEX = Index()
 def t3_prompts(thread_id):
     try:
         import sqlite3
-        with sqlite3.connect(f"file:{T3_ROOT / 'state.sqlite'}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{T3_ROOT / 'state.sqlite'}?mode=ro", uri=True)) as conn:
             rows = conn.execute("select text from projection_thread_messages where thread_id = ? and role = 'user' order by created_at limit ?",
                                 (thread_id, SUMMARY_PROMPT_LIMIT))
             return [prompt_text(text) for (text,) in rows if text]

@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import closing
 from agent_transcripts import read_transcript, transcript_page
 
 
@@ -10,7 +11,7 @@ class TranscriptTests(unittest.TestCase):
     def test_t3_chat_and_pagination_keep_all_messages(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            with sqlite3.connect(root / "state.sqlite") as db:
+            with closing(sqlite3.connect(root / "state.sqlite")) as db, db:
                 db.executescript("create table projection_threads(thread_id text, title text); create table projection_thread_messages(thread_id text, role text, text text, created_at text);")
                 db.execute("insert into projection_threads values (?, ?)", ("chat-123", "Improve the search"))
                 db.executemany("insert into projection_thread_messages values (?, ?, ?, ?)", [("chat-123", "user", f"message {i}", f"{i:04}") for i in range(105)])
