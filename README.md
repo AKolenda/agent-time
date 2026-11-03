@@ -35,8 +35,6 @@ systemctl --user restart agent-time.service
 
 `AGENT_TIME_TRUSTED_CLIENTS` accepts a comma-separated list of IPs. Check the service with `systemctl --user status agent-time.service` or open `http://<AGENT_TIME_HOST>:8080/health`.
 
-Run `python3 -m unittest -v` from this repository to verify source attribution and timestamp filtering.
-
 ## Client-facing chat descriptions
 
 Agent Time writes a short, client-facing description for each chat once it has been quiet for two minutes, using the Codex CLI (`gpt-5.6-terra`, low reasoning) and T3 Code's title prompt. It runs under the desktop's own login, so no API key is needed. The description is exposed as `conversation_summary` on every interval, alongside `conversation_title`, which uses the saved T3 thread name when a native session maps to T3, and cached in `~/.cache/agent-time/summaries.json` so each chat is summarized once. Only the first few user prompts are sent to the model, never the full transcript.
