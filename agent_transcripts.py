@@ -6,6 +6,8 @@ import sqlite3
 from pathlib import Path
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
+# T3 Code thread ids may also be "mcp:launch:<hash>" or URL-escaped subagent ids; they are only ever SQL parameters.
+T3_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:%-]{6,256}$")
 
 
 def text_content(content):
@@ -22,8 +24,8 @@ def clean_text(text):
     return text.strip()[:20000]
 
 
-def read_transcript(source, conversation_id, t3_root, claude_root, codex_root):
-    if not ID_PATTERN.fullmatch(conversation_id):
+def read_transcript(source, conversation_id, t3_root, claude_roots, codex_root):
+    if not (T3_ID_PATTERN if source == "T3 Code" else ID_PATTERN).fullmatch(conversation_id):
         raise ValueError("A valid chat id is required")
     messages = []
     title = ""
@@ -35,7 +37,16 @@ def read_transcript(source, conversation_id, t3_root, claude_root, codex_root):
         if text and not text.startswith("Base directory for this skill:"):
             messages.append({"role": role, "text": text, "at": at})
 
-    if source == "T3 Code":
+    if source == "T3 Code" and (t3_root / "statev2.sqlite").is_file():
+        with closing(sqlite3.connect(f"file:{t3_root / 'statev2.sqlite'}?mode=ro", uri=True, timeout=5)) as conn:
+            thread = conn.execute("select title from orchestration_v2_projection_threads where thread_id = ?", (conversation_id,)).fetchone()
+            if not thread:
+                return None
+            title = thread[0] or ""
+            for role, text, at in conn.execute("""select role, json_extract(payload_json, '$.text'), created_at
+                    from orchestration_v2_projection_messages where thread_id = ? order by created_at, message_id""", (conversation_id,)):
+                append(role, text or "", at)
+    elif source == "T3 Code":
         database = t3_root / "state.sqlite"
         if not database.is_file():
             return None
@@ -48,7 +59,7 @@ def read_transcript(source, conversation_id, t3_root, claude_root, codex_root):
                 append(role, text or "", at)
     else:
         if source == "Claude":
-            file = next(claude_root.glob(f"*/{conversation_id}.jsonl"), None)
+            file = next((f for root in claude_roots for f in root.glob(f"*/{conversation_id}.jsonl")), None)
         elif source in ("Codex", "ChatGPT"):
             file = next(codex_root.glob(f"**/*-{conversation_id}.jsonl"), None)
         else:

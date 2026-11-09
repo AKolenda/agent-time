@@ -1,6 +1,6 @@
 # Agent Time
 
-Agent Time reads local Claude and Codex transcripts plus T3 Code's on-device activity log. T3 Code runs are attributed to their Codex or Claude agent and retain the workspace project, so they use the same project mapping in TimeTracker. Its network address and trusted clients are set in `~/.config/agent-time.env`.
+Agent Time reads local Claude and Codex transcripts (including T3 Code's `~/.claude-proxy` sessions) plus T3 Code's on-device state. On current T3 Code it reads `~/.t3/userdata/statev2.sqlite` read-only: each provider turn becomes an interval with source `T3 Code`, the T3 thread ID as `conversation_id`, and the thread title. Subagent turns are credited to the thread that launched them. A turn still running with activity in the last ten minutes is reported as `live`. Older installs without `statev2.sqlite` keep using the provider event logs. The project is the workspace folder name; T3 worktrees (`~/.t3/worktrees/<repo>/…`) are billed to their repo, so they use the same project mapping in TimeTracker. Its network address and trusted clients are set in `~/.config/agent-time.env`.
 
 Requires Python 3.10+ and Linux with systemd. The optional title generator also requires an authenticated Codex CLI.
 
@@ -44,6 +44,7 @@ Settings in `~/.config/agent-time.env`: `AGENT_TIME_SUMMARIES=0` turns this off;
 ## Local import API
 
 - `GET /api/v1/projects` lists Agent Time project names.
+- `GET /api/data` also returns `t3_projects`: every open T3 Code project as `{name, title}`, where `name` matches interval `project` and `title` is the name shown in T3 Code.
 - `GET /api/v1/intervals` returns raw intervals, including whether each interval came from T3 Code, Codex, or Claude plus its local conversation ID and title. Optional query filters: `project`, `agent`, `start`, and `end`; timestamps accept Unix seconds or ISO-8601.
 - `GET /api/v1/import` returns billable blocks grouped only within each source project. It accepts the same filters plus `gap_minutes`, which defaults to `15` (use `0` for exact transcript intervals).
 

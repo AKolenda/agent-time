@@ -10,9 +10,11 @@ from pathlib import Path
 from contextlib import closing
 from urllib.parse import parse_qs, urlparse
 
-CLAUDE_ROOT = Path.home() / ".claude/projects"
+# T3 Code runs Claude with ~/.claude-proxy as its config directory.
+CLAUDE_ROOTS = (Path.home() / ".claude/projects", Path.home() / ".claude-proxy/projects")
 CODEX_ROOT = Path.home() / ".codex/sessions"
 T3_ROOT = Path.home() / ".t3/userdata"
+T3_V2_DATABASE = "statev2.sqlite"  # T3 Code moved its state here in October 2026; its event logs no longer carry CANON lines.
 LIVE_GRACE = 600  # An unfinished transcript is live while recently updated.
 TURN_IDLE_LIMIT = 1800  # A Claude turn with no activity this long is treated as abandoned, not billable.
 ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
@@ -130,6 +132,80 @@ def prompt_text(value):
         return text[:100] + " ... " + text[-(SUMMARY_PROMPT_CHARS-105):]
     return text
 
+def project_name(cwd):
+    """T3 worktrees live at ~/.t3/worktrees/<repo>/<worktree>; bill them to the repo, not the throwaway folder."""
+    parts = Path(cwd).parts
+    for i in range(len(parts) - 2):
+        if parts[i:i + 2] == (".t3", "worktrees"): return parts[i + 2]
+    return os.path.basename(cwd.rstrip(os.sep)) or cwd
+
+def t3_database():
+    """The live T3 state database: statev2 on current T3 Code, state.sqlite on older installs."""
+    v2 = T3_ROOT / T3_V2_DATABASE
+    return v2 if v2.is_file() else T3_ROOT / "state.sqlite"
+
+def t3_connect():
+    return closing(sqlite3.connect(f"file:{t3_database()}?mode=ro", uri=True, timeout=5))
+
+def t3_v2_present():
+    return (T3_ROOT / T3_V2_DATABASE).is_file()
+
+def t3_agent(provider_thread_id):
+    """provider-thread:provider:<kind>:... names the agent that ran the turn."""
+    kind = (provider_thread_id or "").split(":")[2:3]
+    kind = kind[0] if kind else ""
+    return {"claudeAgent": "Claude", "codex": "Codex", "grok": "Grok", "antigravity": "Gemini"}.get(kind, kind or "T3 Code")
+
+def t3_v2_turns(now):
+    """Each provider turn in T3 Code's v2 state is one block of agent work in its thread.
+    Subagent threads are credited to the thread that launched them, so time ties to a thread the user can open."""
+    with t3_connect() as conn:
+        projects = {pid: (title or "", root or "") for pid, title, root in
+                    conn.execute("select project_id, title, workspace_root from projection_projects")}
+        threads = {tid: (pid, title or "") for tid, pid, title in conn.execute(
+            "select thread_id, project_id, title from orchestration_v2_projection_threads where deleted_at is null")}
+        parents = dict(conn.execute("select child_thread_id, thread_id from orchestration_v2_projection_subagents where child_thread_id is not null"))
+        turns = list(conn.execute("""select provider_turn_id, thread_id, provider_thread_id, status, started_at, completed_at
+            from orchestration_v2_projection_provider_turns where started_at is not null"""))
+        unfinished = [turn[0] for turn in turns if not turn[5]]
+        last_activity = {}
+        for chunk in range(0, len(unfinished), 500):
+            ids = unfinished[chunk:chunk + 500]
+            last_activity.update(conn.execute(
+                f"select provider_turn_id, max(updated_at) from orchestration_v2_projection_turn_items where provider_turn_id in ({','.join('?' * len(ids))}) group by provider_turn_id", ids))
+    result = []
+    for turn_id, thread_id, provider_thread_id, status, started, completed in turns:
+        owner, seen = thread_id, set()
+        while owner in parents and owner not in seen: seen.add(owner); owner = parents[owner]
+        if owner not in threads and thread_id in threads: owner = thread_id
+        if owner not in threads: continue
+        project_id, title = threads[owner]
+        title_root = projects.get(project_id) or projects.get(threads.get(thread_id, ("",))[0]) or ("", "")
+        start = parse_ts(started)
+        if start is None: continue
+        end, live = parse_ts(completed), False
+        if end is None:
+            last = parse_ts(last_activity.get(turn_id)) or start
+            # A turn is live while it is still running and has done something recently.
+            if status in ("running", "waiting", "starting", "preparing") and now - last <= LIVE_GRACE: end, live = now, True
+            else: end = last
+        if end <= start: continue
+        root = title_root[1]
+        result.append(Interval(start, end, t3_agent(provider_thread_id), project_name(root) if root else (title_root[0] or "Unknown project"),
+                               root, "T3 Code", "", live, owner, title))
+    return result
+
+def t3_projects():
+    """Every open T3 Code project, so a billing project can be linked before it has any activity."""
+    try:
+        with t3_connect() as conn:
+            rows = conn.execute("""select title, workspace_root from projection_projects
+                where deleted_at is null and archived_at is null and workspace_root is not null""")
+            found = {}
+            for title, root in rows: found.setdefault(project_name(root), {"name": project_name(root), "title": title or ""})
+            return sorted(found.values(), key=lambda p: p["name"].casefold())
+    except (sqlite3.Error, OSError): return []
+
 class Record:
     def __init__(self, path, kind):
         self.path, self.kind = path, kind
@@ -139,7 +215,7 @@ class Record:
 
     @property
     def project(self):
-        if self.cwd: return os.path.basename(self.cwd.rstrip(os.sep)) or self.cwd
+        if self.cwd: return project_name(self.cwd)
         return self.path.parent.name if self.kind == "claude" else "Unknown project"
 
     def reset(self):
@@ -290,10 +366,8 @@ class Index:
     def t3_threads(self):
         """T3 keeps the workspace and chat title separately from its append-only event logs."""
         try:
-            import sqlite3
-            database = T3_ROOT / "state.sqlite"
-            if not database.is_file(): return {}
-            with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
+            if not t3_database().is_file(): return {}
+            with t3_connect() as conn:
                 rows = conn.execute("""select t.thread_id, p.workspace_root, t.title
                     from projection_threads t join projection_projects p on p.project_id = t.project_id
                     where t.deleted_at is null and p.deleted_at is null""")
@@ -305,8 +379,7 @@ class Index:
     def t3_session_links(self):
         """Resolve native provider sessions back to their saved T3 thread names."""
         try:
-            import sqlite3
-            with closing(sqlite3.connect(f"file:{T3_ROOT / 'state.sqlite'}?mode=ro", uri=True)) as conn:
+            with t3_connect() as conn:
                 rows = conn.execute("""select t.thread_id, t.title, s.provider_thread_id,
                     s.provider_session_id, r.resume_cursor_json
                     from projection_threads t
@@ -324,9 +397,11 @@ class Index:
                 return titles
         except (sqlite3.Error, OSError): return {}
     def paths(self):
-        if CLAUDE_ROOT.is_dir(): yield from ((p, "claude") for p in CLAUDE_ROOT.glob("*/*.jsonl"))
+        for root in CLAUDE_ROOTS:
+            if root.is_dir(): yield from ((p, "claude") for p in root.glob("*/*.jsonl"))
         if CODEX_ROOT.is_dir(): yield from ((p, "codex") for p in CODEX_ROOT.glob("**/*.jsonl"))
-        if T3_ROOT.is_dir(): yield from ((p, "t3") for p in T3_ROOT.glob("logs/provider/events.*.log*"))
+        # Current T3 Code is read from its v2 state instead; its event logs no longer describe turns.
+        if T3_ROOT.is_dir() and not t3_v2_present(): yield from ((p, "t3") for p in T3_ROOT.glob("logs/provider/events.*.log*"))
     def scan(self):
         with self.lock:
             seen = set()
@@ -345,6 +420,9 @@ class Index:
             for key in set(self.records) - seen: del self.records[key]
             now = time.time(); items = []
             for record in self.records.values(): items.extend(record.snapshot(now))
+            if t3_v2_present():
+                try: items.extend(t3_v2_turns(now))
+                except (sqlite3.Error, OSError) as error: print(f"T3 Code state unreadable: {error}", file=sys.stderr, flush=True)
             for item in items: item.conversation_summary = SUMMARIES.get(item.conversation_id)
             links = self.t3_session_links()
             for item in items:
@@ -368,6 +446,7 @@ class Index:
         began = time.perf_counter(); items = self.scan()
         return {"now": time.time(), "timezone": datetime.now().astimezone().tzname(),
                 "projects": sorted({x.project for x in items}, key=str.casefold),
+                "t3_projects": t3_projects(),
                 "intervals": [asdict(x) for x in items], "files": len(self.records),
                 "scan_ms": round((time.perf_counter()-began)*1000)}
 
@@ -375,10 +454,13 @@ INDEX = Index()
 
 def t3_prompts(thread_id):
     try:
-        import sqlite3
-        with closing(sqlite3.connect(f"file:{T3_ROOT / 'state.sqlite'}?mode=ro", uri=True)) as conn:
-            rows = conn.execute("select text from projection_thread_messages where thread_id = ? and role = 'user' order by created_at limit ?",
-                                (thread_id, SUMMARY_PROMPT_LIMIT))
+        with t3_connect() as conn:
+            if t3_v2_present():
+                rows = conn.execute("""select json_extract(payload_json, '$.text') from orchestration_v2_projection_messages
+                    where thread_id = ? and role = 'user' order by created_at limit ?""", (thread_id, SUMMARY_PROMPT_LIMIT))
+            else:
+                rows = conn.execute("select text from projection_thread_messages where thread_id = ? and role = 'user' order by created_at limit ?",
+                                    (thread_id, SUMMARY_PROMPT_LIMIT))
             return [prompt_text(text) for (text,) in rows if text]
     except Exception: return []
 
@@ -573,7 +655,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 offset = int((params.get("offset") or ["0"])[-1])
                 if offset < 0: raise ValueError("Offset must be nonnegative")
-                transcript = read_transcript((params.get("source") or [""])[-1], (params.get("id") or [""])[-1], T3_ROOT, CLAUDE_ROOT, CODEX_ROOT)
+                transcript = read_transcript((params.get("source") or [""])[-1], (params.get("id") or [""])[-1], T3_ROOT, CLAUDE_ROOTS, CODEX_ROOT)
                 if transcript is None: self.json({"error": "Chat not found on this machine."}, 404)
                 else: self.json({"transcript": transcript_page(transcript, offset)})
             except ValueError as error: self.json({"error": str(error)}, 400)
@@ -619,7 +701,7 @@ def export(path):
 def serve(port, browser=True, host="127.0.0.1", allowed_clients=None):
     global ALLOWED_CLIENTS
     ALLOWED_CLIENTS = {"127.0.0.1", "::1", host, *(allowed_clients or [])}
-    if not CLAUDE_ROOT.is_dir() and not CODEX_ROOT.is_dir() and not T3_ROOT.is_dir(): sys.exit("No Claude, Codex, or T3 Code activity found.")
+    if not any(root.is_dir() for root in CLAUDE_ROOTS) and not CODEX_ROOT.is_dir() and not T3_ROOT.is_dir(): sys.exit("No Claude, Codex, or T3 Code activity found.")
     print("Indexing local transcripts…",flush=True); INDEX.scan(); SUMMARIES.start()
     try: server=ThreadingHTTPServer((host,port),Handler)
     except OSError as e:
