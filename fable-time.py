@@ -156,43 +156,74 @@ def t3_agent(provider_thread_id):
     kind = kind[0] if kind else ""
     return {"claudeAgent": "Claude", "codex": "Codex", "grok": "Grok", "antigravity": "Gemini"}.get(kind, kind or "T3 Code")
 
+T3_TURN_ACTIVITY = {}  # Finished turns never change, so their activity is read from T3 once.
+
+def active_spans(points):
+    """Split a turn's activity timestamps wherever the agent went quiet for longer than TURN_IDLE_LIMIT,
+    so a turn left waiting on a question or a cancel hours later is not billed as one long block."""
+    spans = []
+    for point in sorted(points):
+        if spans and point - spans[-1][1] <= TURN_IDLE_LIMIT: spans[-1][1] = point
+        else: spans.append([point, point])
+    return [(start, end) for start, end in spans if end > start]
+
+def t3_turn_activity(conn, turn_ids):
+    """Timestamps of everything that happened in each turn: messages, tool calls, questions, subagents."""
+    found = {turn_id: [] for turn_id in turn_ids}
+    for chunk in range(0, len(turn_ids), 500):
+        ids = turn_ids[chunk:chunk + 500]
+        for turn_id, updated in conn.execute(
+                f"select provider_turn_id, updated_at from orchestration_v2_projection_turn_items where provider_turn_id in ({','.join('?' * len(ids))})", ids):
+            stamp = parse_ts(updated)
+            if stamp is not None: found[turn_id].append(stamp)
+    return found
+
 def t3_v2_turns(now):
-    """Each provider turn in T3 Code's v2 state is one block of agent work in its thread.
-    Subagent threads are credited to the thread that launched them, so time ties to a thread the user can open."""
+    """Each provider turn in T3 Code's v2 state is agent work in its thread, minus any stretch longer than
+    TURN_IDLE_LIMIT with no activity. Subagent threads are credited to the thread that launched them,
+    so time ties to a thread the user can open."""
     with t3_connect() as conn:
         projects = {pid: (title or "", root or "") for pid, title, root in
                     conn.execute("select project_id, title, workspace_root from projection_projects")}
         threads = {tid: (pid, title or "") for tid, pid, title in conn.execute(
             "select thread_id, project_id, title from orchestration_v2_projection_threads where deleted_at is null")}
         parents = dict(conn.execute("select child_thread_id, thread_id from orchestration_v2_projection_subagents where child_thread_id is not null"))
-        turns = list(conn.execute("""select provider_turn_id, thread_id, provider_thread_id, status, started_at, completed_at
-            from orchestration_v2_projection_provider_turns where started_at is not null"""))
-        unfinished = [turn[0] for turn in turns if not turn[5]]
-        last_activity = {}
-        for chunk in range(0, len(unfinished), 500):
-            ids = unfinished[chunk:chunk + 500]
-            last_activity.update(conn.execute(
-                f"select provider_turn_id, max(updated_at) from orchestration_v2_projection_turn_items where provider_turn_id in ({','.join('?' * len(ids))}) group by provider_turn_id", ids))
+        turns = []
+        for turn_id, thread_id, provider_thread_id, status, started, completed in conn.execute(
+                """select provider_turn_id, thread_id, provider_thread_id, status, started_at, completed_at
+                from orchestration_v2_projection_provider_turns where started_at is not null"""):
+            start, end = parse_ts(started), parse_ts(completed)
+            if start is not None: turns.append((turn_id, thread_id, provider_thread_id, status, start, end))
+        # Only turns long enough to hold an idle gap, or still running, need their activity read.
+        unread = [turn[0] for turn in turns if (turn[5] is None or turn[5] - turn[4] > TURN_IDLE_LIMIT)
+                  and (turn[5] is None or turn[0] not in T3_TURN_ACTIVITY)]
+        activity = t3_turn_activity(conn, unread)
+    for turn_id, _, _, _, start, end in turns:
+        if end is not None and turn_id in activity: T3_TURN_ACTIVITY[turn_id] = activity[turn_id]
     result = []
-    for turn_id, thread_id, provider_thread_id, status, started, completed in turns:
+    for turn_id, thread_id, provider_thread_id, status, start, end in turns:
         owner, seen = thread_id, set()
         while owner in parents and owner not in seen: seen.add(owner); owner = parents[owner]
         if owner not in threads and thread_id in threads: owner = thread_id
         if owner not in threads: continue
         project_id, title = threads[owner]
         title_root = projects.get(project_id) or projects.get(threads.get(thread_id, ("",))[0]) or ("", "")
-        start = parse_ts(started)
-        if start is None: continue
-        end, live = parse_ts(completed), False
-        if end is None:
-            last = parse_ts(last_activity.get(turn_id)) or start
+        if end is not None and end - start <= TURN_IDLE_LIMIT: spans, live = ([(start, end)] if end > start else []), False
+        else:
+            stamps = activity.get(turn_id, T3_TURN_ACTIVITY.get(turn_id, []))
+            # Items such as subagents can update after their turn ends; that time belongs to no turn here.
+            if end is not None: stamps = [stamp for stamp in stamps if start <= stamp <= end]
+            spans, live = active_spans([start, *stamps, *([end] if end is not None else [])]), False
             # A turn is live while it is still running and has done something recently.
-            if status in ("running", "waiting", "starting", "preparing") and now - last <= LIVE_GRACE: end, live = now, True
-            else: end = last
-        if end <= start: continue
+            last = max([start, *stamps])
+            if end is None and status in ("running", "waiting", "starting", "preparing") and now - last <= LIVE_GRACE:
+                spans = active_spans([start, *stamps, now]); live = True
         root = title_root[1]
-        result.append(Interval(start, end, t3_agent(provider_thread_id), project_name(root) if root else (title_root[0] or "Unknown project"),
-                               root, "T3 Code", "", live, owner, title))
+        project = project_name(root) if root else (title_root[0] or "Unknown project")
+        agent = t3_agent(provider_thread_id)
+        for index, (span_start, span_end) in enumerate(spans):
+            result.append(Interval(span_start, span_end, agent, project, root, "T3 Code", "",
+                                   live and index == len(spans) - 1, owner, title))
     return result
 
 def t3_projects():
