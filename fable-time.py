@@ -208,9 +208,11 @@ def t3_v2_turns(now):
         if owner not in threads: continue
         project_id, title = threads[owner]
         title_root = projects.get(project_id) or projects.get(threads.get(thread_id, ("",))[0]) or ("", "")
-        if end is not None and end - start <= TURN_IDLE_LIMIT: spans, live = [(start, end)], False
+        if end is not None and end - start <= TURN_IDLE_LIMIT: spans, live = ([(start, end)] if end > start else []), False
         else:
             stamps = activity.get(turn_id, T3_TURN_ACTIVITY.get(turn_id, []))
+            # Items such as subagents can update after their turn ends; that time belongs to no turn here.
+            if end is not None: stamps = [stamp for stamp in stamps if start <= stamp <= end]
             spans, live = active_spans([start, *stamps, *([end] if end is not None else [])]), False
             # A turn is live while it is still running and has done something recently.
             last = max([start, *stamps])
