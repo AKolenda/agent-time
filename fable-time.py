@@ -16,7 +16,7 @@ CODEX_ROOT = Path.home() / ".codex/sessions"
 T3_ROOT = Path.home() / ".t3/userdata"
 T3_V2_DATABASE = "statev2.sqlite"  # T3 Code moved its state here in October 2026; its event logs no longer carry CANON lines.
 LIVE_GRACE = 600  # An unfinished transcript is live while recently updated.
-TURN_IDLE_LIMIT = 1800  # A Claude turn with no activity this long is treated as abandoned, not billable.
+TURN_IDLE_LIMIT = 1800  # Transcript silence beyond this is not assumed to be billable work.
 ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
 SUMMARY_CACHE = Path.home() / ".cache/agent-time/summaries.json"
 SUMMARY_PROMPT_LIMIT, SUMMARY_PROMPT_CHARS = 8, 400
@@ -289,16 +289,35 @@ class Record:
             return
         if event == "task_started":
             start = parse_ts(payload.get("started_at")) or ts
-            if start: self.active[key] = {"start": start, "last": ts or start, "model": self.model}
+            if start is not None:
+                if key in self.active: return  # Replayed starts must not reset activity.
+                # A session runs one turn at a time. Forked transcripts can contain an
+                # inherited parent start with no matching completion in this file.
+                for old in self.active.values():
+                    self.add(old["start"], old["last"], old["model"])
+                self.active.clear()
+                self.active[key] = {"start": start, "last": ts or start, "model": self.model}
             return
-        if ts:
-            for active in self.active.values(): active["last"] = max(active["last"], ts)
-        if event in ("task_complete", "turn_aborted", "task_cancelled"):
-            active = self.active.pop(key, None)
-            if not active and len(self.active) == 1: _, active = self.active.popitem()
-            if active:
-                self.add(parse_ts(payload.get("started_at")) or active["start"],
-                         parse_ts(payload.get("completed_at")) or ts or active["last"], active["model"])
+        # Explicit IDs must match. Only legacy events without an ID may use the
+        # sole open turn; unrelated completions must never close or refresh it.
+        active = self.active.get(key)
+        if active is None and not payload.get("turn_id") and len(self.active) == 1:
+            key, active = next(iter(self.active.items()))
+        if active is None: return
+        terminal = event in ("task_complete", "turn_aborted", "task_cancelled")
+        # Configuration/queue events are not evidence of agent work.
+        if not terminal and event not in ("item_completed", "token_count", "agent_message", "agent_reasoning"):
+            return
+        end = (parse_ts(payload.get("completed_at")) if terminal else None) or ts
+        if end is None: return
+        if end - active["last"] > TURN_IDLE_LIMIT:
+            self.add(active["start"], active["last"], active["model"])
+            # Resume from observed activity, never bridge hours/days of silence.
+            active["start"] = end
+        active["last"] = max(active["last"], end)
+        if terminal:
+            self.active.pop(key)
+            self.add(active["start"], active["last"], active["model"])
 
     def t3(self, obj):
         """Read T3 Code's canonical local activity events without their duplicated raw events."""
