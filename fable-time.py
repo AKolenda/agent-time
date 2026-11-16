@@ -226,6 +226,11 @@ def t3_v2_turns(now):
                                    live and index == len(spans) - 1, owner, title))
     return result
 
+def t3_environment_id():
+    """This machine's T3 Code environment, so a thread can be linked as app.t3.codes/threads/<environment>/<thread>."""
+    try: return (T3_ROOT / "environment-id").read_text().strip()
+    except OSError: return ""
+
 def t3_projects():
     """Every open T3 Code project, so a billing project can be linked before it has any activity."""
     try:
@@ -496,7 +501,7 @@ class Index:
         began = time.perf_counter(); items = self.scan()
         return {"now": time.time(), "timezone": datetime.now().astimezone().tzname(),
                 "projects": sorted({x.project for x in items}, key=str.casefold),
-                "t3_projects": t3_projects(),
+                "t3_projects": t3_projects(), "t3_environment_id": t3_environment_id(),
                 "intervals": [asdict(x) for x in items], "files": len(self.records),
                 "scan_ms": round((time.perf_counter()-began)*1000)}
 
